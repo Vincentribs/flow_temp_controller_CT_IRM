@@ -1,4 +1,3 @@
-//TEST GITHUB
 #include <WiFi.h>
 #include <Arduino.h>
 #include <WebServer.h>
@@ -198,7 +197,6 @@ void loop() {
   
   Blynk.run();
   timer.run();
-  sendBlynk();
 
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -212,9 +210,11 @@ void loop() {
 
       // Mettre à jour la date et l'heure
       getFormattedDateTime();
+      
    
       // Envoyer les données
       Send_DATA(temperatureIN, temperatureOUT, debit,  dayStamp, timeStamp, global_DeviceName, global_DeviceNumber);
+      sendBlynk();
       // Mettre à jour le moment du dernier envoi
       lastDataSendTime = currentTime;
        Write_DATA();

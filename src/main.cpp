@@ -595,6 +595,7 @@ void writeFile_SD(fs::FS &fs, const char * path, const char * message) {
   File file = fs.open(path, FILE_WRITE);
   if(!file) {
     Serial.println("Failed to open file for writing");
+    SD_init();
     return;
   }
   if(file.print(message)) {
@@ -613,7 +614,6 @@ void Append_DATA_SD(fs::FS &fs, const char * path, const char * message) {
   if(!file) {
     Serial.println("Failed to open file for appending");
     SD_init();
-    
     return;
   }
   if(file.print(message)) {

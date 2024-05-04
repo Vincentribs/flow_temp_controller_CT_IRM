@@ -1,13 +1,9 @@
 #include <WiFi.h>
 #include <Arduino.h>
-#include <WebServer.h>
 #include <HTTPClient.h>
 #include <Adafruit_GFX.h>
 #include <ArduinoJson.h>
 #include <time.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
-#include <EEPROM.h>
 #include <Adafruit_SSD1306.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
@@ -16,31 +12,53 @@
 #include <stdlib.h>
 #include <string.h>
 #include "FS.h"
-#include <SD.h>
-#include <SPI.h>
 #include "utilities.h"
 #include <Wire.h>
+#include <ArduinoHttpClient.h>
+#include <esp_adc_cal.h>
 
+//ALL CLASS....................
+#include "SD_Manager.h"
+#include "Eeprom_Manager.h"
+#include "WebServer_Manager.h"
+#include "HttpRequest_Manager.h"
+#include "DateTime_Manager.h"
+#include "Oled_Manager.h"
+#include "Temp_Manager.h"
+//............................
 
-
+//BLYNK CONTENTS...............................................
 #define BLYNK_TEMPLATE_ID "TMPL4sQab-LLf"
 #define BLYNK_TEMPLATE_NAME "Water flow and temp meter device"
 #define BLYNK_AUTH_TOKEN "-VpXPSx3308b550B-A5MnkosS0pmdgtJ"
 #include <Blynk.h>
-
+//....................................................................
 
 //WIFI CONTENTS............................
 const char* ssid = "iPhone";
 const char* password = "Sest_Siemens@56";
 //............................................
 
+//CLASS OBJECTS.................................................................
+HttpRequest_Manager HttpRequest_manager("https://prod-01.westeurope.logic.azure.com:443/workflows/7d254d10055740139d924de23ddad9d6/triggers/manual/paths/invoke?api-version=2016-06-01&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=tMdfU4rTNOX6Yjz-56Ap5Qn08llK16QJXVtuB0OvvlA");
+DateTime_Manager DateTime_manager;
+Oled_Manager Oled_manager;
+Eeprom_Manager Eeprom_manager(Oled_manager);
+WebServer_Manager WebServer_manager(80, Eeprom_manager);
+//...........................................................................
+
+//TEMPERATURE CONTENTS......................
+#define Pin 4
 float temperatureIN;
 float temperatureOUT;
 float debit;
+Temp_Manager Temp_manager(Pin);
+//..................................................
 
+// Déclaration de la variable pour stocker la tension de la batterie
+uint16_t battery_voltage = 0;
 
-//SIMMODULE CONFIGURATION.............................................
-//#define TINY_GSM_MODEM_SIM7600
+//MODULE GSM CONTENTS.......................................................................
 
 // Define the serial console for debug prints, if needed
 #define TINY_GSM_DEBUG SerialMon
@@ -51,16 +69,16 @@ float debit;
 // See all AT commands, if wanted
 //#define DUMP_AT_COMMANDS
 
-
 #define PIN "9528"
 #include <TinyGsmClient.h>
 #include <BlynkSimpleTinyGSM.h>
-BlynkTimer timer;
+//BlynkTimer timer;
 
 const char apn[] = "internet.proximus.be";
 const char gprsUser[] = "";
 const char gprsPass[] = "";
-const int port = 80; // Standard HTTP port
+const char gprsserver[] = "prod-01.westeurope.logic.azure.com";
+const int port = 80;
 #ifdef DUMP_AT_COMMANDS  // if enabled it requires the streamDebugger lib
 #include <StreamDebugger.h>
 StreamDebugger debugger(SerialAT, SerialMon);
@@ -68,9 +86,14 @@ TinyGsm modem(debugger);
 #else
 TinyGsm modem(SerialAT);
 #endif
+//.............................................................................................
 
+
+//TIME AND NORMES CONTENTS.....................................................
 unsigned long lastSMSTime = 0;
-const unsigned long intervalBetweenSMS = 300000;
+const unsigned long intervalBetweenSMS = 30000;
+unsigned long last_ok_time = 0;
+const unsigned long minIntervalAfterOK = 300000;
 
 bool Fluctuation_flag = false; 
 // Définition des plages de mesure
@@ -80,75 +103,28 @@ const int plageDiff_min = 5;
 const int plageDiff_max = 50;
 //....................................................................................
 
+
 //Permet à la boucle de s'exécuter toutes les 10 sec.....................
 unsigned long lastDataSendTime = 0; // Variable pour stocker le moment de la dernière envoi
+unsigned long lastSDWriteTime = 0; 
+unsigned long lastBlynkSendTime = 0;
 //...............................................................
 
-//DEFINE MODULE SD CARD...............
-#define SD_MISO     2
-#define SD_MOSI     15
-#define SD_SCLK     14
-#define SD_CS       13
-SPIClass sdSPI(VSPI);
-char dataC[256];
-//....................................
-
-//FORMATTED TIME CONTENTS (NTP SERVER)................
-// Define NTP Client to get time
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP);
-// Variables to save date and time
-struct tm timeinfo;
-// Variables to save date and time
-char formattedDate[20];
-char dayStamp[12];
-char timeStamp[9];
-//....................................................
 
 //EEPROM VARIABLES.................................
-int addr_DeviceName = 0;
-int addr_DeviceNumber = sizeof(String); 
-int addr_PhoneNumber = sizeof(String) * 2;
 String global_DeviceName;
 String global_DeviceNumber;
 String sms_target;
 //..................................................
 
-//WEB SERVER CONTENTS............
-WebServer server(80);
-const char* html_page;
-//...............................
-
-//TEMPERATURE READING CONTENTS...................................................
-#define ONE_WIRE_BUS 4
-// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
-OneWire oneWire(ONE_WIRE_BUS);
-// Pass our oneWire reference to Dallas Temperature. 
-DallasTemperature sensors(&oneWire);
-// Number of temperature devices found
-int numberOfDevices;
-// We'll use this variable to store a found device address
-DeviceAddress tempDeviceAddress; 
-//..............................................................................
 
 //ALL FUNCTIONS...........................................................................................................
-void printAddress(DeviceAddress deviceAddress);
-void Send_DATA(float valeur1, float valeur2, float valeur3, char* valeur4, char* valeur5, String valeur6, String valeur7);
 void getFormattedDateTime();
 void randomvalue();
-void sendBlynk();
+void sendBlynk(float temperatureIN, float temperatureOUT, float debit);
+void receive_SMS();
+void readBatteryVoltage();
 
-void locateDevice();
-void tempReading();
-void webInterface();
-void webLogic();
-void readEEPROMData();
-
-//Sd card functions//
-void SD_init();
-void Write_DATA();
-void Append_DATA_SD(fs::FS &fs, const char * path, const char * message);
-void writeFile_SD(fs::FS &fs, const char * path, const char * message);
 
 //MOBILE FUNCTIONS
 void modem_setup();
@@ -160,469 +136,137 @@ void setup() {
 
   // Initialize serial communication first
   Serial.begin(115200);
+  Oled_manager.init();
+  Temp_manager.begin();
+  Oled_manager.writemessage("Temp sensor initialing...");
+  delay(1000);
+  Oled_manager.writemessage("Temp sensor initialized!");
+  delay(1000);
+ 
 
   // Other initialization tasks
-  sensors.begin();
   EEPROM.begin(512);
+  Oled_manager.writemessage("Setup EEPROM Memory!");
+
+  delay(1000);
+
+  //CLASS....................
+  SD_Manager SD_manager;
+  SD_manager.sd_init(); 
+  Oled_manager.writemessage("SD Initialized!");
+  delay(1000);
+  modem_setup();
+  delay(2000);
 
 // CONNEXION AU WIFI.....................
   WiFi.begin(ssid, password);
   Serial.print("Connecting to Wifi.");
+  Oled_manager.writemessage("Connecting to Wifi...");
+  
   while (WiFi.status() != WL_CONNECTED) {
     delay(1000);
     Serial.print(".");
   }
   Serial.println("WiFi connected!");
+  Oled_manager.writemessage("WiFi connected!");
   Serial.print("Adresse IP: ");
   Serial.println(WiFi.localIP());
+  delay(2000);
 //.......................................
-  randomSeed(analogRead(0)); // Initialisation de la graine pour les valeurs aléatoires
+
+
+//WEBSERVER Functions...................................
+  WebServer_manager.begin();
+  WebServer_manager.webInterface();
+  WebServer_manager.webLogic();
+  Oled_manager.writemessage("Web server online!");
+//......................................................
+  
+  Temp_manager.locateDevice();
+
+  randomSeed(analogRead(34)); // Initialisation de la graine pour les valeurs aléatoires
   randomvalue();
 
-  readEEPROMData();
+//Récupération des variables de l'eeprom................
+  Eeprom_manager.get_Eeprom_DeviceName();
+  Eeprom_manager.get_Eeprom_DeviceNumber();
+  Eeprom_manager.get_Eeprom_PhoneNumber();
+//.............................................................
 
-  modem_setup();
-  webInterface();
-  webLogic();
-  locateDevice();
+  DateTime_manager.getSIMDateTime();
+  // Obtenez les valeurs de date et d'heure sous forme de chaînes de caractères
+  const char* date = DateTime_manager.getDate();
+  const char* hour = DateTime_manager.getTime();
 
-  SD_init();
-  Write_DATA();
+  SD_manager.write_data(temperatureIN,temperatureOUT,debit,date,hour,global_DeviceName, global_DeviceNumber);
 }
 
 void loop() {
-
+  unsigned long currentTime = millis();
   randomvalue();
-  readEEPROMData();
-  
+
+  global_DeviceName = Eeprom_manager.get_Eeprom_DeviceName();
+  global_DeviceNumber = Eeprom_manager.get_Eeprom_DeviceNumber();
+  sms_target = Eeprom_manager.get_Eeprom_PhoneNumber();
+
+  // Exécution de Blynk et gestion des minuteries
   Blynk.run();
-  timer.run();
 
+  //Lecture des température via le ONEWIRE. 
+  /*
+    Temp_manager.tempReading();
+    temperatureIN = Temp_manager.getTemperatureIN();
+    temperatureOUT = Temp_manager.getTemperatureOUT();
+  */
 
+  // Récupérer la date et l'heure à partir de la classe DateTime_Manager
+  DateTime_manager.getSIMDateTime();
+  // Obtenez les valeurs de date et d'heure sous forme de chaînes de caractères
+  const char* date = DateTime_manager.getDate();
+  const char* hour = DateTime_manager.getTime();
+  
   if (WiFi.status() == WL_CONNECTED) {
-
-    server.handleClient();
-
-    // Obtenir le temps actuel en millisecondes
-    unsigned long currentTime = millis();
-    
-    if (currentTime - lastDataSendTime >= 20000) {
-
-      // Mettre à jour la date et l'heure
-      getFormattedDateTime();
-      
-   
-      // Envoyer les données
-      Send_DATA(temperatureIN, temperatureOUT, debit,  dayStamp, timeStamp, global_DeviceName, global_DeviceNumber);
-      sendBlynk();
+    WebServer_manager.handleClient();
+    // Envoi des données toutes les 20 secondes si le WiFi est connecté
+    if (currentTime - lastDataSendTime >= 20000 && WiFi.status() == WL_CONNECTED) {
+      HttpRequest_manager.sendData(temperatureIN, temperatureOUT, debit, date, hour, global_DeviceName, global_DeviceNumber);
       // Mettre à jour le moment du dernier envoi
       lastDataSendTime = currentTime;
-       Write_DATA();
-
     }
-    
-    if (millis() - lastSMSTime >= intervalBetweenSMS) {
-      // Votre condition pour envoyer un SMS
-      if (debit < plageA_min || debit > plageA_max || (abs(temperatureOUT - temperatureIN) < plageDiff_min || abs(temperatureOUT - temperatureIN) > plageDiff_max)) {
-        send_SMS(sms_target, dayStamp, timeStamp, debit, temperatureIN, temperatureOUT, global_DeviceName, global_DeviceNumber);
-        lastSMSTime = millis(); // Mettre à jour le moment de l'envoi du SMS
+  }
+
+
+  sendBlynk(temperatureIN, temperatureOUT, debit);
+  Oled_manager.oled_data(temperatureIN, temperatureOUT, debit, battery_voltage);
+
+  // Enregistrement des données dans la carte SD toutes les 20 secondes
+  if (currentTime - lastSDWriteTime >= 20000) {
+    SD_Manager SD_manager;
+    SD_manager.write_data(temperatureIN,temperatureOUT,debit,date,hour,global_DeviceName, global_DeviceNumber);
+    // Mettre à jour le moment de la dernière écriture dans la carte SD
+    lastSDWriteTime = currentTime;
+  }
+
+  // Appel de la fonction pour recevoir les SMS
+  receive_SMS();
+
+  // Condition pour envoyer un SMS
+  if (debit < plageA_min || debit > plageA_max || (abs(temperatureOUT - temperatureIN) < plageDiff_min || abs(temperatureOUT - temperatureIN) > plageDiff_max)) {
+    // Vérifier si le délai de 5 minutes après la réception du SMS "OK" est écoulé
+    if (millis() - last_ok_time >= minIntervalAfterOK) {
+      // Envoi de SMS toutes les 30 secondes
+      if (millis() - lastSMSTime >= intervalBetweenSMS) {
+        send_SMS(sms_target, date, hour, debit, temperatureIN, temperatureOUT, global_DeviceName, global_DeviceNumber);
+        // Mettre à jour le moment de l'envoi du SMS
+        lastSMSTime = millis();
       }
     }
   }
-  else {
-    Serial.print("Wifi failed. Passage en mode hors connexion");
-    delay(2000);
 
-  }
 
+  readBatteryVoltage();
 }
 
-// function to send all the data to PowerAutomate flow with a Http request
-void Send_DATA(float valeur1, float valeur2, float valeur3, char* valeur4, char* valeur5,  String valeur6,  String valeur7) {
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-
-    //Server URL
-    String url = "https://prod-01.westeurope.logic.azure.com:443/workflows/7d254d10055740139d924de23ddad9d6/triggers/manual/paths/invoke?api-version=2016-06-01&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=tMdfU4rTNOX6Yjz-56Ap5Qn08llK16QJXVtuB0OvvlA";
-
-    // Create JSON object
-    StaticJsonDocument<200> jsonDocument;
-    jsonDocument["temperatureIN"] = valeur1;
-    jsonDocument["temperatureOUT"] = valeur2;
-    jsonDocument["debit"] = valeur3;
-    jsonDocument["date"] = valeur4;
-    jsonDocument["hour"] = valeur5;
-    jsonDocument["Device Name"] = valeur6;
-    jsonDocument["Device Number"] = valeur7;
-
-    // Serialize JSON to string
-    String jsonData;
-    serializeJson(jsonDocument, jsonData);
-
-    Serial.print("Sending the data ... ");
-    Serial.println(jsonData);
-
-    // Start the HTTP Connection.
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
-    //http.addHeader("Authorization", "Bearer VOTRE_CLÉ_API");
-
-    // Send the post request with the data.
-    int codeReponse = http.POST(jsonData);
-
-    // Check the response of the server.
-    if (codeReponse > 0) {
-      Serial.print("Response: ");
-      Serial.println(codeReponse);
-      String reponse = http.getString();
-      Serial.println(reponse);
-    } else {
-      Serial.print("HTTP Request Error: ");
-      Serial.println(codeReponse);
-    }
-
-    // Free up the resources of the HTTP connection
-    http.end();
-  } else {
-    Serial.println("WiFi connection error.");
-  }
-}
-
-//function who takes the local time to a NTP server every hour. 
-void getFormattedDateTime() {
-  unsigned long lastUpdateTime = 0;
-  const unsigned long updateInterval = 60000;  // Mettre à jour le temps toutes les 60 secondes (60000 millisecondes)
-  
-  // Vérifier si le temps doit être mis à jour//
-  if (millis() - lastUpdateTime >= updateInterval || lastUpdateTime == 0) {
-    
-    // Mettre à jour le temps uniquement si nécessaire
-    timeClient.update();
-
-    // Enregistrer le moment de la dernière mise à jour
-    lastUpdateTime = millis();
-  }
-
-  // Obtain elapsed time since epoch (January 1, 1970) in seconds
-  time_t rawtime = timeClient.getEpochTime();
-  
-  // Ajouter le décalage horaire (par exemple, 1 heure = 3600 secondes)
-  rawtime += 7200;
-
-  // Convertir le temps en une structure de temps (struct tm) contenant la date et l'heure
-  localtime_r(&rawtime, &timeinfo);
-  
-  // Formater la date et l'heure
-  strftime(formattedDate, sizeof(formattedDate), "%Y-%m-%d %H:%M:%S", &timeinfo);
-  
-  // Extraire la date et l'heure des structures de temps
-  strftime(dayStamp, sizeof(dayStamp), "%Y-%m-%d", &timeinfo);
-  strftime(timeStamp, sizeof(timeStamp), "%H:%M:%S", &timeinfo);
-
-  // Afficher la date et l'heure
-  Serial.println(formattedDate);
-  Serial.print("DATE: ");
-  Serial.println(dayStamp);
-  Serial.print("HOUR: ");
-  Serial.println(timeStamp);
-}
-
-// function to print a device address
-void printAddress(DeviceAddress deviceAddress) {
-  for (uint8_t i = 0; i < 8; i++){
-    if (deviceAddress[i] < 16) Serial.print("0");
-      Serial.print(deviceAddress[i], HEX);
-  }
-}
-
-// function who locate and define device ADD 
-void locateDevice(){
-
-  // Grab a count of devices on the wire
-  numberOfDevices = sensors.getDeviceCount();
-
-  // locate devices on the bus
-  Serial.print("Locating temp devices...");
-  Serial.print("Found ");
-  Serial.print(numberOfDevices, DEC);
-  Serial.println(" devices.");
-
-  // Loop through each device, print out address
-  for(int i=0;i<numberOfDevices; i++){
-    // Search the wire for address
-    if(sensors.getAddress(tempDeviceAddress, i)){
-      Serial.print("Found device ");
-      Serial.print(i, DEC);
-      Serial.print(" with address: ");
-      printAddress(tempDeviceAddress);
-      Serial.println(" ");
-    } else {
-      Serial.print("Found ghost device at ");
-      Serial.print(i, DEC);
-      Serial.print(" but could not detect address. Check power and cabling");
-    }
-  }
-}
-
-// function who read the température of the DS18B20 sensors
-/*void tempReading(){ 
-
-  sensors.requestTemperatures(); // Send the command to get temperatures
-  
-  // Loop through each device, print out temperature data
-  for(int i=0;i<numberOfDevices; i++){
-    // Search the wire for address
-    if(sensors.getAddress(tempDeviceAddress, i)){
-      // Output the device ID
-      Serial.print("Device_add ");
-      Serial.print(i);
-      Serial.print(" ");
-      if (i == 0) {
-        Serial.print("TempératureIN: ");
-        temperatureIN = sensors.getTempC(tempDeviceAddress); // Get temperature reading
-        Serial.println(temperatureIN);
-      } else if (i == 1) {
-        Serial.print("TempératureOUT: ");
-        temperatureOUT = sensors.getTempC(tempDeviceAddress); // Get temperature reading
-        Serial.println(temperatureOUT);
-      }
-    }
-  }
-}
-*/
-
-// function for the design of the web server
-void webInterface(){
-
-html_page = R"(
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Water flow/temp meter device</title>
-  <style>
-    body {
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      background-color: #f9f9f9;
-      margin: 0;
-      padding: 0;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      height: 100vh;
-    }
-    #container {
-      width: 400px;
-      padding: 30px;
-      background-color: #fff;
-      border-radius: 10px;
-      box-shadow: 0 0 20px rgba(0, 0, 0, 0.1);
-    }
-    h1 {
-      text-align: center;
-      color: #333;
-    }
-    form {
-      margin-top: 20px;
-    }
-    label {
-      display: block;
-      margin-bottom: 5px;
-      color: #555;
-    }
-    input[type="text"] {
-      width: 100%;
-      padding: 10px;
-      margin-bottom: 20px;
-      border: 1px solid #ddd;
-      border-radius: 5px;
-      transition: border-color 0.3s ease;
-    }
-    input[type="text"]:focus {
-      border-color: #007bff;
-    }
-    input[type="button"] {
-      width: 100%;
-      padding: 10px;
-      background-color: #007bff;
-      color: #fff;
-      border: none;
-      border-radius: 5px;
-      cursor: pointer;
-      transition: background-color 0.3s ease;
-    }
-    input[type="button"]:hover {
-      background-color: #0056b3;
-    }
-    img {
-      display: block;
-      margin: 0 auto;
-      max-width: 100%;
-      height: auto;
-      margin-bottom: 20px;
-      width: 200px; 
-    }
-  </style>
-</head>
-<body>
-  <div id='container'>
-    <img src='https://oncovalue.org/wp-content/uploads/2023/03/Siemens_Healthineers_logo.svg_.png' alt='Logo' width="100">
-    <h1>Water flow/temp meter</h1>
-    <form id='myForm'>
-      <label for='deviceName'>Device Name:</label>
-      <input type='text' id='deviceName' name='deviceName' placeholder="Enter the device name">
-      <label for='deviceNumber'>Serial number:</label>
-      <input type='text' id='deviceNumber' name='deviceNumber' placeholder="Enter the Serial number">
-      <label for='phoneNumber'>Phone number :</label>
-      <input type='text' id='phoneNumber' name='phoneNumber' placeholder="Enter your phone number">
-      <input type='button' value='Save' onclick='submitForm()'>
-    </form>
-  </div>
-  <script>
-    function submitForm() {
-      var form = document.getElementById('myForm');
-      var deviceName = form.elements['deviceName'].value;
-      var deviceNumber = form.elements['deviceNumber'].value;
-      var phoneNumber = form.elements['phoneNumber'].value;
-      var xhr = new XMLHttpRequest();
-      xhr.open('POST', '/send', true);
-      xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-      xhr.onreadystatechange = function() {
-        if (xhr.readyState == XMLHttpRequest.DONE && xhr.status == 200) {
-          alert(xhr.responseText);
-          form.reset();
-        }
-      };
-      xhr.send('deviceName=' + encodeURIComponent(deviceName) + '&deviceNumber=' + encodeURIComponent(deviceNumber) + '&phoneNumber=' + encodeURIComponent(phoneNumber));
-    }
-  </script>
-</body>
-</html>
-)";
-
-
-}
-
-// function to interact with the web server
-void webLogic(){
-
-    // Route pour la page d'accueil du web server
-  server.on("/", HTTP_GET, []() {
-    server.send(200, "text/html", html_page);
-  });
-
-  // Route pour recevoir les données
-  server.on("/send", HTTP_POST, []() {
-    String DeviceName = server.arg("deviceName");
-    String DeviceNumber = server.arg("deviceNumber");
-    String PhoneNumber = server.arg("phoneNumber");
-    
-    // Enregistrement des valeurs dans l'EEPROM
-    EEPROM.put(addr_DeviceName, DeviceName);
-    EEPROM.put(addr_DeviceNumber, DeviceNumber);
-    EEPROM.put(addr_PhoneNumber, PhoneNumber);
-    EEPROM.commit(); // Commit des changements
-    Serial.println("Data saved in EEPROM !");
-
-    Serial.print("Device Name: ");
-    Serial.println(DeviceName);
-    Serial.print("Device Number: ");
-    Serial.println(DeviceNumber);
-    Serial.print("Device Name: ");
-    Serial.println(PhoneNumber);
-    server.send(200, "text/plain", "Data send ! :)");
-  });
-
-  server.begin();
-  Serial.println("Serveur Web démarré !");
-}
-
-//Fonction d'initialisation de la carte SD
-void SD_init(){
-  
-// INITIALIZING SD CARD ...........................
-  sdSPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
-  if(!SD.begin(SD_CS, sdSPI)) {
-    Serial.println("Card Mount Failed");
-    return;
-  }
-  Serial.println("SPI.OK!");
-  uint8_t cardType = SD.cardType();
-  if(cardType == CARD_NONE) {
-    Serial.println("No SD card attached");
-    return;
-  }
-  Serial.println("Initializing SD card...");
-  if (!SD.begin(SD_CS)) {
-    Serial.println("!ERROR! initialization failed!");
-    return;  
-  }
-  Serial.println("Initialization SD card OK !");
-//..................................................
-
-
-// IF FILE NOT EXIST CREATE NEW FILE (SD CARD)...............
-  File file = SD.open("/DATA_SAVE1.txt");
-  if(!file) {
-    Serial.println("File doens't exist");
-    Serial.println("Creating file...");
-    writeFile_SD(SD, "/DATA_SAVE1.txt", "Reading ID, Date, Hour, Temperature \r\n");
-  }
-  else {
-    Serial.println("File already exists");  
-  }
-  file.close();
-//..................................................
-
-}
-
-// Fonction qui permet juste mettre notre data dans une variable et fait appel à Append_DATA pour ajouter dans le fichier présent dans la carte SD  //
-void Write_DATA() {
-
-  sprintf(dataC, "%.2f %.2f %.2f %s %s %s %s", temperatureIN, temperatureOUT, debit, dayStamp, timeStamp, global_DeviceName, global_DeviceNumber);
-  String dataMessage = String(dataC);
-  dataMessage += "\n";
-  Serial.print("Save data.. ");
-  Serial.println(dataMessage);
-  Append_DATA_SD(SD, "/DATA_SAVE1.txt", dataMessage.c_str());
-}
-
-// FUNCTION TO WRITE A NEW FILE TO SD CARD //
-void writeFile_SD(fs::FS &fs, const char * path, const char * message) {
-  Serial.printf("Writing file: %s\n", path);
-
-  File file = fs.open(path, FILE_WRITE);
-  if(!file) {
-    Serial.println("Failed to open file for writing");
-    SD_init();
-    return;
-  }
-  if(file.print(message)) {
-    Serial.println("File written");
-  } else {
-    Serial.println("Write failed");
-  }
-  file.close();
-}
-
-// Append data to the SD card 
-void Append_DATA_SD(fs::FS &fs, const char * path, const char * message) {
-  Serial.printf("Appending to file: %s\n", path);
-
-  File file = fs.open(path, FILE_APPEND);
-  if(!file) {
-    Serial.println("Failed to open file for appending");
-    SD_init();
-    return;
-  }
-  if(file.print(message)) {
-    Serial.println("Message appended");
-  } else {
-    Serial.println("Append failed");
-  }
-  file.close();
-}
 
 // Fonction qui permet de mettre en place toutes les fonctionalitées gsm. 
 void modem_setup(){
@@ -652,6 +296,7 @@ void modem_setup(){
     SerialAT.begin(115200, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
 
     Serial.println("Start modem...");
+    Oled_manager.writemessage("Start modem...");
     delay(3000);
 
     while (!modem.testAT()) {
@@ -663,28 +308,34 @@ void modem_setup(){
 
     // Unlock SIM PIN
     Serial.println("Unlocking SIM PIN...");
+    Oled_manager.writemessage("Unlocking SIM PIN...");
+    delay(1000);
+
     if (modem.simUnlock(PIN)) {
         Serial.println("SIM unlocked successfully!");
+        Oled_manager.writemessage("SIM unlocked successfully!");
     } else {
         Serial.println("Failed to unlock SIM!");
+        Oled_manager.writemessage("Failed to unlock SIM!");
     }
+    delay(1000);
 
     // Check network registration
     Serial.println("Checking network registration...");
+    Oled_manager.writemessage("Checking network registration...");
     if (!modem.waitForNetwork()) {
         Serial.println("Failed to register to network!");
+        Oled_manager.writemessage("Failed to register to network!");
         return;
     } else {
         Serial.println("Network registered!");
+        Oled_manager.writemessage("Network registered!");
     }
     // Print messages before Blynk initialization
-  Serial.println("Avant Blynk.begin");
+  
 
   // Initialize Blynk
   Blynk.begin(BLYNK_AUTH_TOKEN, modem, apn, gprsUser, gprsPass);
-
-  // Print message after Blynk initialization (optional)
-  Serial.print("Après Blynk.begin");
 
 }
 
@@ -698,30 +349,84 @@ bool send_SMS(const String& phoneNumber, const String& dayStamp, const String& t
   message += "Temp IN : " + String(temperatureIN) + "\n";
   message += "Temp OUT : " + String(temperatureOUT) + "\n";
   
-  Serial.println("Fluctuation !! Alarme send!");
+  Serial.println("Fluctuation !!");
+
+  // Envoi du SMS et vérification du succès
+  bool success = modem.sendSMS(phoneNumber, message);
+  if (success) {
+    Serial.println("SMS envoyé avec succès !");
+  } 
+  else {
+    Serial.println("Échec de l'envoi du SMS !");
+  }
   
   return modem.sendSMS(phoneNumber, message);
 }
 
-void randomvalue() {
 
+void receive_SMS() {
+  // Envoie la commande AT pour vérifier les SMS non lus
+  modem.sendAT(F("AT+CMGL=\"REC UNREAD\""));
+
+  // Attend la réponse du module (le contenu des SMS non lus)
+  String response = String((char*)modem.waitResponse());
+
+  // Vérifie si la réponse contient des SMS non lus
+  if (response.indexOf("+CMGL:") != -1) {
+    // Lecture du premier SMS non lu
+    modem.sendAT(F("AT+CMGR=1"));
+
+    // Attend la réponse du module (le contenu du premier SMS non lu)
+    String smsContent = String((char*)modem.waitResponse());
+
+    // Supprimer le premier SMS après l'avoir lu
+    modem.sendAT(F("AT+CMGD=1"));
+
+    // Traiter le contenu du SMS (par exemple, vérifier si c'est "OK")
+    if (smsContent.indexOf("OK") != -1) {
+      last_ok_time = millis(); // Mettre à jour le moment de la dernière réception du SMS "OK"
+    }
+  }
+}
+
+
+void randomvalue() {
   // Génère de nouvelles valeurs aléatoires
   temperatureIN = random(13,15);
   temperatureOUT = random(12, 14);
   debit = random(2000, 2500);
 }
 
-void readEEPROMData() {
-    EEPROM.get(addr_DeviceName, global_DeviceName);
-    EEPROM.get(addr_DeviceNumber, global_DeviceNumber);
-    EEPROM.get(addr_PhoneNumber, sms_target);
+
+void read_EEPROM_Data() {
+//Récupération des variables de l'eeprom........................
+  global_DeviceName = Eeprom_manager.get_Eeprom_DeviceName();
+  global_DeviceNumber = Eeprom_manager.get_Eeprom_DeviceNumber();
+  sms_target = Eeprom_manager.get_Eeprom_PhoneNumber();
+//.............................................................
 }
 
-void sendBlynk(){
+void sendBlynk(float temperatureIN, float temperatureOUT, float debit){
 
     Blynk.virtualWrite(V0, temperatureIN);
     Blynk.virtualWrite(V1, temperatureOUT);
     Blynk.virtualWrite(V2, debit);
+    Blynk.virtualWrite(V3, battery_voltage);
+    delay(100);
 }
 
+// Fonction pour lire la tension de la batterie
+void readBatteryVoltage() {
+    // Configuration de l'ADC
+    esp_adc_cal_characteristics_t adc_chars;
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
+    
+    // Lecture de la tension de la batterie
+    battery_voltage = (esp_adc_cal_raw_to_voltage(analogRead(BOARD_BAT_ADC_PIN), &adc_chars) * 2);
+    
+    // Affichage de la tension de la batterie
+    Serial.print("Tension de la batterie : ");
+    Serial.print(battery_voltage);
+    Serial.println(" mV");
+}
 
